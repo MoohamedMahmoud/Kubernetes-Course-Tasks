@@ -1,0 +1,71 @@
+# Apply this manifest only for the intentional failure demonstration.
+# It differs from deployment.yaml only in the init-done command.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-deployment
+  namespace: webapp
+  labels:
+    app: web
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      shareProcessNamespace: true
+      initContainers:
+        - name: init-done
+          image: busybox:1.36
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-c", "echo 'init failed'; exit 1"]
+      containers:
+        - name: nginx
+          image: nginx:1.27
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              printf '<h1>hello in MLOPS MENA COMMUNITY : %s</h1>\n' "$(date '+%Y-%m-%d %H:%M:%S')" > /usr/share/nginx/html/index.html
+              exec nginx -g 'daemon off;'
+          ports:
+            - name: http
+              containerPort: 80
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 3
+            timeoutSeconds: 1
+            failureThreshold: 5
+        - name: time-updater
+          image: busybox:1.36
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              while true; do
+                PID="$(pgrep -o nginx || true)"
+                if [ -n "$PID" ] && [ -d "/proc/$PID/root/usr/share/nginx/html" ]; then
+                  printf '<h1>hello in MLOPS MENA COMMUNITY : %s</h1>\n' "$(date '+%Y-%m-%d %H:%M:%S')" \
+                    > "/proc/$PID/root/usr/share/nginx/html/index.html"
+                fi
+                sleep 5
+              done
+          securityContext:
+            capabilities:
+              add:
+                - SYS_PTRACE

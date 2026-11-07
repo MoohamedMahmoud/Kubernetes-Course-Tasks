@@ -1,0 +1,71 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-deployment
+  namespace: webapp
+  labels:
+    app: web
+spec:
+  replicas: 3
+  # Keep the three existing replicas available while a replacement is not ready.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      # The sidecar needs to see the nginx process and access its root filesystem.
+      shareProcessNamespace: true
+      initContainers:
+        - name: init-done
+          image: busybox:1.36
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-c", "echo done"]
+      containers:
+        - name: nginx
+          image: nginx:1.27
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              printf '<h1>hello in MLOPS MENA COMMUNITY : %s</h1>\n' "$(date '+%Y-%m-%d %H:%M:%S')" > /usr/share/nginx/html/index.html
+              exec nginx -g 'daemon off;'
+          ports:
+            - name: http
+              containerPort: 80
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 3
+            timeoutSeconds: 1
+            failureThreshold: 5
+        - name: time-updater
+          image: busybox:1.36
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              while true; do
+                PID="$(pgrep -o nginx || true)"
+                if [ -n "$PID" ] && [ -d "/proc/$PID/root/usr/share/nginx/html" ]; then
+                  printf '<h1>hello in MLOPS MENA COMMUNITY : %s</h1>\n' "$(date '+%Y-%m-%d %H:%M:%S')" \
+                    > "/proc/$PID/root/usr/share/nginx/html/index.html"
+                fi
+                sleep 5
+              done
+          securityContext:
+            capabilities:
+              add:
+                - SYS_PTRACE
