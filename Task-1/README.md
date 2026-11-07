@@ -1,130 +1,381 @@
 # Task Session 1 — Multi-container Pods (Init Container & Sidecar)
 
-## Objective
+## 1. Objective
 
-Deploy an Nginx Hello page on a **3-node Minikube cluster**. Each Pod has one Init Container and two regular containers. The HTML page displays a timestamp that is refreshed every five seconds.
+Deploy an Nginx Hello page on a three-node Minikube Kubernetes cluster.
 
-Expected page format:
+Each application Pod contains:
+- One Init Container that must complete successfully before the application containers start.
+- One Nginx main container that serves an HTML page.
+- One sidecar container that updates the HTML page's timestamp every five seconds.
+
+The solution uses a shared process namespace to allow the sidecar to locate the Nginx master process and update its HTML file through `/proc/<pid>/root`, without defining application volumes.
+
+**Expected page content:**
 
 ```text
 hello in MLOPS MENA COMMUNITY : YYYY-MM-DD HH:MM:SS
 ```
 
-## Pod design
+## 2. Kubernetes Environment
 
-| Container | Type | Image | Responsibility |
-|---|---|---|---|
-| `init-done` | Init Container | `busybox:1.36` | Prints `done` and exits successfully before the regular containers start |
-| `nginx` | Main container | `nginx:1.27` | Writes the initial HTML file and serves it on port 80 |
-| `time-updater` | Sidecar | `busybox:1.36` | Finds the Nginx master process and updates its HTML file every five seconds through `/proc/<pid>/root` |
+| Component | Configuration |
+|---|---|
+| Operating system | Windows 11 Pro |
+| Container runtime | Docker Desktop |
+| Kubernetes tool | Minikube v1.39.0 |
+| Kubernetes version | v1.37.0 |
+| Kubernetes CLI | kubectl |
+| Minikube driver | Docker |
+| Container runtime inside nodes | containerd |
+| Cluster profile | task1 |
+| Number of nodes | 3 |
+| Container Network Interface | Calico |
+| Namespace | webapp |
 
-The Pod uses `shareProcessNamespace: true`. **No volumes are defined.** The sidecar adds the `SYS_PTRACE` capability as required by the task instructions.
+### Cluster architecture
 
-## Files
+The cluster consists of one control-plane node and two worker nodes.
 
-- `namespace.yaml` — creates the `webapp` namespace.
-- `deployment.yaml` — working three-replica Deployment.
-- `deployment-fail-init.yaml` — intentional failure variant; the Init Container exits with code 1.
-- `deploy.ps1` — applies the namespace and working Deployment.
-- `test-failure.ps1` — applies the intentional failure variant and prints the diagnostic commands.
-- `recover.ps1` — reapplies the working Deployment and waits for recovery.
-- `verify.ps1` — runs the main verification commands.
-- `screenshots/` — place submission screenshots here.
+| Node | Role | Status |
+|---|---|---|
+| task1 | Control-plane | Ready |
+| task1-m02 | Worker | Ready |
+| task1-m03 | Worker | Ready |
 
-## Prerequisites
+All three nodes reached the `Ready` state.
 
-- Minikube cluster with three nodes and Calico, as required by the task.
-- `kubectl` configured to use that Minikube cluster.
-- Docker driver available to Minikube.
+### Cluster creation
 
-Example cluster command from the task instructions (run only when the machine has sufficient resources):
+For a new Minikube profile, the initial cluster can be created with:
 
 ```powershell
-minikube start -p task1 --driver=docker --nodes=3 --cni=calico --cpus=2 --memory=2200
+minikube start -p task1 `
+    --driver=docker `
+    --nodes=3 `
+    --cni=calico `
+    --cpus=2 `
+    --memory=2200
 ```
 
-Before continuing, verify:
+If the profile already exists with only one node, additional worker nodes can be added using:
 
 ```powershell
-kubectl get nodes
+minikube node add -p task1 --worker
+minikube node add -p task1 --worker
+```
+
+Verify the cluster:
+
+```powershell
+kubectl get nodes -o wide
 ```
 
 All three nodes should show `Ready`.
 
-## 1. Deploy the working application
+## 3. Project Structure
 
-Open PowerShell in this `Task-1` directory and run:
+```text
+Task-1/
+│
+├── README.md
+├── namespace.yaml
+├── deployment.yaml
+├── deployment-fail-init.yaml
+├── deploy.ps1
+├── test-failure.ps1
+├── recover.ps1
+├── verify.ps1
+│
+└── screenshots/
+    ├── 01-nodes-ready.png
+    ├── 02-pods-running.png
+    ├── 03-shared-process.png
+    ├── 04-timestamp-update.png
+    ├── 05-init-failure.png
+    ├── 06-init-failure-details.png
+    └── 07-recovery-and-final-verification.png
+```
+
+## 4. Namespace Configuration
+
+The namespace manifest, `namespace.yaml`, creates the dedicated namespace:
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: webapp
+```
+
+Apply it using:
+
+```powershell
+kubectl apply -f .\namespace.yaml
+```
+
+Verify:
+
+```powershell
+kubectl get namespaces
+```
+
+## 5. Pod Architecture and Container Responsibilities
+
+The Deployment is named `web-deployment`, uses the label `app: web`, and maintains three replicas.
+
+Each Pod contains the following containers:
+
+| Container | Type | Image | Responsibility |
+|---|---|---|---|
+| init-done | Init Container | busybox:1.36 | Prints `done` and exits successfully before the regular containers start. |
+| nginx | Main container | nginx:1.27 | Creates the initial HTML page and serves it on port 80. |
+| time-updater | Sidecar | busybox:1.36 | Locates the Nginx master process and updates its HTML file every five seconds. |
+
+### Shared process namespace
+
+The Pod specification includes:
+
+```yaml
+shareProcessNamespace: true
+```
+
+This allows the sidecar to see the Nginx processes running in the same Pod.
+
+The sidecar uses:
+
+```sh
+PID="$(pgrep -o nginx || true)"
+```
+
+It then accesses the Nginx container's filesystem through:
+
+```text
+/proc/<pid>/root/usr/share/nginx/html/index.html
+```
+
+The sidecar also adds the capability required by the task:
+
+```yaml
+securityContext:
+  capabilities:
+    add:
+      - SYS_PTRACE
+```
+
+**Volumes:** No application volumes are explicitly defined in the Pod template. The HTML file is accessed through the shared process namespace and `/proc/<pid>/root`.
+
+Kubernetes may automatically inject a projected service-account volume into a running Pod. This is separate from application-defined volumes.
+
+## 6. Deploy the Working Application
+
+The working Deployment is defined in:
+
+`deployment.yaml`
+
+It includes:
+- Three replicas.
+- The `init-done` Init Container.
+- The Nginx main container.
+- The `time-updater` sidecar.
+- A shared process namespace.
+- No explicitly defined Pod-template volumes.
+
+The Deployment also uses a rolling-update strategy:
+
+```yaml
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxSurge: 1
+    maxUnavailable: 0
+```
+
+This preserves the existing available replicas while a replacement Pod is being initialized.
+
+### Deployment command
+
+Run from the `Task-1` directory:
 
 ```powershell
 .\deploy.ps1
 ```
 
-Or run the commands individually:
+Alternatively, apply the resources individually:
 
 ```powershell
 kubectl apply -f .\namespace.yaml
+
 kubectl apply -f .\deployment.yaml
+
 kubectl rollout status deployment/web-deployment -n webapp --timeout=180s
-kubectl get pods -n webapp -l app=web -o wide
 ```
 
-Expected result: three Pods, each showing `2/2 Running`. The completed Init Container is not counted in the regular-container READY column.
+Verify the Deployment and Pods:
 
-## 2. Open the Nginx page and observe the timestamp
+```powershell
+kubectl get deployment,pods -n webapp -o wide
+```
 
-In one PowerShell window:
+**Expected result:**
+
+- Deployment: `3/3` ready replicas.
+- Three application Pods.
+- Each Pod: `2/2 Running`.
+- The Init Container has completed successfully and is not counted in the regular-container READY column.
+
+## 7. Verify the Init Container
+
+The Init Container must print `done` and exit successfully before Nginx and the sidecar start.
+
+Check its logs:
+
+```powershell
+kubectl logs deployment/web-deployment -n webapp -c init-done
+```
+
+Expected output:
+
+```text
+done
+```
+
+The Init Container should have a successful exit code of `0`.
+
+## 8. Verify Shared Process Namespace and Sidecar
+
+Select an application Pod:
+
+```powershell
+$Pod = kubectl get pods -n webapp -l app=web -o jsonpath='{.items[0].metadata.name}'
+```
+
+Inspect the processes from the sidecar:
+
+```powershell
+kubectl exec -n webapp $Pod -c time-updater -- ps
+```
+
+Expected output includes:
+
+```text
+nginx: master process nginx -g daemon off;
+nginx: worker process
+```
+
+This confirms that the sidecar can see the Nginx processes through the shared process namespace.
+
+### Verify container names
+
+```powershell
+kubectl get pod -n webapp $Pod -o jsonpath='{.spec.initContainers[*].name}'
+
+kubectl get pod -n webapp $Pod -o jsonpath='{.spec.containers[*].name}'
+```
+
+Expected names:
+
+```text
+init-done
+```
+
+```text
+nginx time-updater
+```
+
+## 9. Verify the Dynamic Timestamp
+
+The Nginx container initially writes the required greeting into:
+
+```text
+/usr/share/nginx/html/index.html
+```
+
+The sidecar updates this file continuously.
+
+Check the HTML content:
+
+```powershell
+kubectl exec -n webapp $Pod -c nginx -- cat /usr/share/nginx/html/index.html
+```
+
+Wait six seconds:
+
+```powershell
+Start-Sleep -Seconds 6
+```
+
+Read the file again:
+
+```powershell
+kubectl exec -n webapp $Pod -c nginx -- cat /usr/share/nginx/html/index.html
+```
+
+Expected content:
+
+```html
+<h1>hello in MLOPS MENA COMMUNITY : 2026-11-07 HH:MM:SS</h1>
+```
+
+The timestamp should change between successive checks.
+
+### Browser access
+
+The Nginx application can be accessed locally using port forwarding.
+
+Run:
 
 ```powershell
 kubectl port-forward -n webapp deployment/web-deployment 8080:80
 ```
 
-Keep that command running. Open a browser at:
+Keep the command running and open:
 
-<http://localhost:8080>
+http://localhost:8080
 
-Refresh the page after five seconds. The timestamp should change.
+The browser should display the greeting and timestamp.
 
-You can also inspect the file directly:
+Refresh the page after five seconds to observe the updated timestamp.
 
-```powershell
-kubectl exec deployment/web-deployment -n webapp -c nginx -- cat /usr/share/nginx/html/index.html
-```
+## 10. Verify the No-Volumes Requirement
 
-Run it twice, at least five seconds apart.
-
-## 3. Verify the multi-container design
+Inspect the Pod template:
 
 ```powershell
-kubectl get pods -n webapp -l app=web
-kubectl logs deployment/web-deployment -n webapp -c init-done
-kubectl exec deployment/web-deployment -n webapp -c time-updater -- ps
 kubectl get deployment web-deployment -n webapp -o jsonpath='{.spec.template.spec.volumes}'
 ```
 
-Expected observations:
+Expected result: empty output.
 
-- Three Pods are Ready; each has `2/2` regular containers.
-- Init Container log contains `done`.
-- The sidecar can see the Nginx process (look for `nginx: master process`).
-- The volumes field is empty.
+This confirms that no application volumes are defined in the Deployment's Pod template.
 
-For the exact container names:
+## 11. Intentional Init Container Failure
 
-```powershell
-kubectl get pods -n webapp -l app=web -o jsonpath='{.items[0].spec.initContainers[*].name}{" | "}{.items[0].spec.containers[*].name}'
+The assignment requires testing what happens when the Init Container fails.
+
+The failure configuration is provided in:
+
+`deployment-fail-init.yaml`
+
+The Init Container command is changed to:
+
+```sh
+echo 'init failed'; exit 1
 ```
 
-Expected names: `init-done | nginx time-updater`.
+This prints `init failed` and terminates with exit code `1`.
 
-## 4. Intentionally fail the Init Container
+### Apply the failure configuration
 
-First make sure the working Deployment has three Ready Pods. Then run:
+First ensure the working application has three available replicas.
+
+Run:
 
 ```powershell
 .\test-failure.ps1
 ```
 
-Or apply the failure manifest directly:
+Alternatively:
 
 ```powershell
 kubectl apply -f .\deployment-fail-init.yaml
@@ -133,68 +384,202 @@ kubectl apply -f .\deployment-fail-init.yaml
 Watch the Pods:
 
 ```powershell
-kubectl get pods -n webapp -l app=web -w
+kubectl get pods -n webapp -w
 ```
 
-Use `Ctrl+C` to stop watching. Find the new Pod and inspect it:
+Stop watching with `Ctrl+C` after the failed Pod appears.
+
+### Expected observations
+
+- Kubernetes creates a new Pod for the updated Deployment.
+- The new Pod enters an Init error state, eventually showing `Init:CrashLoopBackOff`.
+- The Init Container repeatedly terminates with exit code `1`.
+- The Nginx and sidecar containers in that failed Pod do not start.
+- The original three healthy Pods remain `2/2 Running`.
+
+The rolling-update configuration uses `maxUnavailable: 0` and `maxSurge: 1`, preserving the three original available replicas during this failed update.
+
+### Inspect the failed Pod
+
+Identify the failed Pod:
 
 ```powershell
-kubectl logs <new-pod-name> -n webapp -c init-done
-kubectl describe pod <new-pod-name> -n webapp
+kubectl get pods -n webapp
 ```
 
-Expected observations:
+Assign its actual name:
 
-- The new Pod moves through an Init error / `Init:CrashLoopBackOff` state.
-- The Init Container exits with code `1` and prints `init failed`.
-- The `nginx` and `time-updater` containers in that new Pod do not start because initialization did not succeed.
-- With `maxUnavailable: 0` and `maxSurge: 1`, the existing three healthy replicas remain available while the new Pod fails to initialize. The page should remain reachable through the port-forward while at least one healthy Pod remains behind the Deployment.
-- The failed rollout is intentional; do not delete the Deployment.
+```powershell
+$FailedPod = "REPLACE_WITH_ACTUAL_FAILED_POD_NAME"
+```
 
-The rollout status command will not complete successfully while the new template is failing. Do not wait indefinitely; inspect the Pods and Events instead.
+Inspect the Init Container logs:
 
-## 5. Restore the working Deployment
+```powershell
+kubectl logs -n webapp $FailedPod -c init-done
+```
 
-Run:
+Expected output:
+
+```text
+init failed
+```
+
+Inspect its details:
+
+```powershell
+kubectl describe pod $FailedPod -n webapp
+```
+
+Important evidence:
+
+```text
+Reason:       Error
+Exit Code:    1
+```
+
+The Pod's initialization condition should remain false, and its application containers should remain unstarted.
+
+### Verify healthy replicas during failure
+
+```powershell
+kubectl get deployment,pods -n webapp
+```
+
+The original three Pods should remain available while the new failed Pod is unable to initialize.
+
+To test browser access specifically during this failure, port-forward directly to one of the original healthy Pods:
+
+```powershell
+kubectl port-forward -n webapp pod/REPLACE_WITH_HEALTHY_POD_NAME 8080:80
+```
+
+Keep the port-forward running and open:
+
+http://localhost:8080
+
+The existing healthy Nginx Pod should continue serving the page.
+
+Note: The failed rollout is intentional. Do not delete the Deployment. The rollout will not complete successfully until the working configuration is restored.
+
+## 12. Restore the Working Deployment
+
+After capturing the failure evidence, restore the original configuration:
 
 ```powershell
 .\recover.ps1
 ```
 
-Or:
+Alternatively:
 
 ```powershell
 kubectl apply -f .\deployment.yaml
+
 kubectl rollout status deployment/web-deployment -n webapp --timeout=180s
-kubectl get deployment web-deployment -n webapp
-kubectl get pods -n webapp -l app=web -o wide
 ```
 
-Expected result: Deployment READY `3/3`, and three Pods each showing `2/2 Running`.
+Verify the final state:
 
-## Screenshot checklist
+```powershell
+kubectl get deployment,pods -n webapp -o wide
+```
 
-Capture genuine screenshots from your own terminal/browser and save them in `screenshots/`:
+**Expected result:**
 
-1. `01-nodes-ready.png` — three Minikube nodes in `Ready` state.
-2. `02-deployment-and-pods.png` — Deployment `3/3` and three Pods `2/2 Running`.
-3. `03-nginx-page-timestamp.png` — Nginx page showing the required greeting and timestamp.
-4. `04-timestamp-updated.png` — a later timestamp showing the five-second update.
-5. `05-init-sidecar-verification.png` — Init Container output and sidecar process listing.
-6. `06-init-failure.png` — failed Pod status and Init Container exit code 1.
-7. `07-healthy-replicas-during-failure.png` — existing healthy replicas remain Ready and the page remains reachable.
-8. `08-recovery.png` — Deployment restored to three Ready replicas.
+```text
+Deployment READY: 3/3
+```
 
-Do not add screenshots until the corresponding result has actually been observed.
+All three Pods should show:
 
-## Cleanup (optional)
+```text
+READY:  2/2
+STATUS: Running
+```
 
-Keep the Minikube cluster for later course tasks. To remove only this task's namespace and its resources:
+The failed Pod should be removed during the successful rollout.
+
+## 13. Final Verification
+
+Run the verification script:
+
+```powershell
+.\verify.ps1
+```
+
+The main verification commands are:
+
+```powershell
+kubectl get nodes -o wide
+
+kubectl get deployment -n webapp
+
+kubectl get pods -n webapp -o wide
+
+kubectl logs deployment/web-deployment -n webapp -c init-done
+
+kubectl exec deployment/web-deployment -n webapp -c time-updater -- ps
+
+kubectl get deployment web-deployment -n webapp -o jsonpath='{.spec.template.spec.volumes}'
+```
+
+The final checks should confirm:
+
+- Three Kubernetes nodes in `Ready` state.
+- Deployment with three available replicas.
+- Three Pods with two running regular containers each.
+- Successful Init Container execution.
+- Nginx processes visible from the sidecar.
+- Dynamic HTML timestamp updates.
+- No explicitly defined Pod-template volumes.
+- Successful recovery after the intentional Init Container failure.
+
+## 14. Screenshots and Evidence
+
+The `screenshots/` directory contains terminal evidence captured during the actual implementation.
+
+| Screenshot | Evidence |
+|---|---|
+| `01-nodes-ready.png` | Three Minikube nodes showing `Ready`. |
+| `02-pods-running.png` | Three application Pods showing `2/2 Running`. |
+| `03-shared-process.png` | Nginx master and worker processes visible from the sidecar. |
+| `04-timestamp-update.png` | HTML content showing the changing timestamp. |
+| `05-init-failure.png` | Intentional Init Container failure and failed Pod state. |
+| `06-init-failure-details.png` | Init Container logs and failure details, including exit code 1. |
+| `07-recovery-and-final-verification.png` | Successful restoration and final healthy Deployment. |
+
+Additional browser screenshots can be included after completing the browser access and failure-availability checks.
+
+All screenshots should be genuine captures from the local PowerShell terminal or browser. Do not substitute generated or simulated output for actual test evidence.
+
+## 15. Cleanup (Optional)
+
+The Minikube cluster can be retained for subsequent course tasks.
+
+To remove only this application's resources:
 
 ```powershell
 kubectl delete namespace webapp
 ```
 
-## Submission
+This removes the `webapp` namespace and its resources without deleting the Minikube cluster.
 
-Place this `Task-1` folder inside the public GitHub repository named **Kubernetes Course Tasks**. Include the YAML files, README and genuine screenshots.
+## 16. Submission
+
+The project is organized under the public GitHub repository:
+
+**Kubernetes Course Tasks**
+
+Repository:
+
+https://github.com/MoohamedMahmoud/Kubernetes-Course-Tasks
+
+The repository contains the `Task-1/` directory with:
+
+- Kubernetes namespace and Deployment manifests.
+- Intentional failure configuration.
+- PowerShell deployment, failure-testing, recovery and verification scripts.
+- Project documentation.
+- Implementation screenshots.
+
+The purpose of this submission is to demonstrate the use of Init Containers, multi-container Pods, shared process namespaces, sidecar containers, rolling updates, failure behavior and application recovery in Kubernetes.
