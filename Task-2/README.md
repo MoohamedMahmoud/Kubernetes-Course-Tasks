@@ -34,7 +34,7 @@ I built `webapp-api:task2` from `webapp/` and `webapp-mysql:task2` from `mysql/`
 
 **Problem and fix.** The MySQL entrypoint *sources* `01-setup.sh` on the first start, so the script must be non-executable and use Linux (LF) line endings. On Windows, Git had converted the script to CRLF, and the first start failed with `$'\r': command not found`, so the `webapp` database was never created. I kept the supplied source unchanged and built the image with `mysql.Dockerfile`, which is the course Dockerfile plus one line that strips the carriage returns and sets mode 644.
 Verified inside the image: `-rw-r--r--` and CR count `0`.
-
+![initializing](screenshots/00-initializing.png)
 ![image fix](screenshots/01-mysql-image-fix.png)
 
 ## 2. Resetting MySQL before re-initialization
@@ -77,6 +77,7 @@ Through this path (browser -> Ingress -> Service `webapp-api` -> app Pod -> Serv
 - `GET /api/messages` returns my message plus the 2 default ones.
 - The web page shows which app Pod answered; both app Pods served requests, so the Service load-balances.
 
+![api_in_other_terminal](screenshots/06a-api.png)
 ![api tests](screenshots/06a-api-tests.png)
 ![browser](screenshots/06b-browser.png)
 
