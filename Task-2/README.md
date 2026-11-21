@@ -3,12 +3,98 @@
 A two-tier guestbook application on the 3-node Minikube cluster from Task 1 (profile `task1`):
 a **FastAPI** app (2 replicas) that reads and writes to **one MySQL** server, exposed through an **NGINX Ingress**.
 
+## Architecture at a glance
+
+**Diagram 1: where things physically run** (cluster, nodes, Pods, containers, namespaces)
+
+![Where things run](images/architecture-placement.png)
+
+**Diagram 2: the path of one request**, and what each piece is for
+
+![Request flow](images/architecture-flow.png)
+
+> The IP addresses are examples from my run (Pod IPs change when a Pod is replaced). The placement of the app replicas and of the ingress controller on the worker nodes is decided by the Kubernetes scheduler; MySQL is the only Pod that is pinned (to `task1-m02`). Check yours with `kubectl get pods -A -o wide`.
+
+## Architecture explained
+
+### 1. Images, containers and Pods
+
+- An **image** is a packaged recipe, built with `docker build`. A **container** is a running copy of an image. A **Pod** is a small wrapper that gives one or more containers one IP address (each Pod in this project holds exactly one container).
+- `webapp-api:task2` was **built by me** from the course folder `webapp/`: a Python base image plus `requirements.txt`, `main.py` and the `static/` files (the HTML and CSS of the web page).
+- `webapp-mysql:task2` was **built on top of the official `mysql:8.4` image** (pulled from Docker Hub) with the course config, the schema and the fixed init script (`mysql.Dockerfile`).
+- Both images were loaded into Minikube (`minikube image load`), because every node has its own image storage, separate from Docker Desktop.
+
+### 2. Cluster, nodes, Pods, containers (Diagram 1)
+
 ```
-Browser -> Ingress (webapp-ingress) -> Service webapp-api (80 -> 8000) -> 2 FastAPI Pods
-                                                                              |
-                                                          Service mysql (3306) -> MySQL Pod -> PVC mysql-pvc -> PV mysql-pv
-ConfigMap webapp-config (app settings)      Secret mysql-secret (credentials)
+Windows PC > Docker Desktop > Cluster "task1"
+                              ├── Node task1      (control plane: API server, scheduler, etcd database)
+                              ├── Node task1-m02  (worker)  ── Pods ── containers
+                              └── Node task1-m03  (worker)  ── Pods ── containers
 ```
+
+- Each node is itself a **Docker container** (only because Minikube runs on Docker; in a real cluster nodes are servers or VMs). Inside the nodes, **containerd** runs the application containers.
+- Pods in the `webapp-stack` namespace: **3** (1 MySQL + 2 FastAPI). The ingress controller adds **1** Pod in `ingress-nginx`, plus 2 one-time Jobs that show `Completed`, plus the system Pods in `kube-system`.
+- A Deployment does not create Pods directly: it creates a **ReplicaSet**, which keeps the wanted number of Pods running. That is why a Pod name looks like `mysql-6c97b8c464-d88z2` (Deployment `mysql`, ReplicaSet `6c97b8c464`, Pod `d88z2`).
+
+### 3. Namespaces
+
+A namespace is a **labeled section for objects** (Pods, Services, Secrets ...). It does **not** contain nodes. Nodes belong to the cluster. Every object of this task is in `webapp-stack`, except the PV, the nodes and the IngressClass (cluster-wide), and the NGINX controller (`ingress-nginx`).
+
+### 4. Records vs running programs
+
+| Object | Is it running somewhere? | What it really is |
+|---|---|---|
+| ConfigMap `webapp-config` | No | A record in the cluster database (etcd). Its values are copied into the containers as environment variables when they start |
+| Secret `mysql-secret` | No | Same, for the credentials |
+| Ingress `webapp-ingress` | No | A routing **rule**: path `/` goes to Service `webapp-api:80` |
+| Ingress **controller** | Yes (a Pod, NGINX) | The program that reads the rule and forwards the traffic |
+| Deployment | No | A record that tells Kubernetes to keep N Pods alive |
+
+### 5. Storage: MySQL, PV, PVC, StorageClass
+
+- **MySQL is a Pod** (created by the `mysql` Deployment), not a PV or a PVC. The PV and the PVC are only the disk it writes to.
+- Chain: **MySQL Pod -> PVC `mysql-pvc` -> PV `mysql-pv` -> folder `/data/webapp-mysql` on node `task1-m02`.** The Pod mounts the PVC at `/var/lib/mysql` and never touches the PV directly.
+- The **PV** is the storage resource (cluster-wide, no namespace). The **PVC** is the request for it (inside `webapp-stack`).
+- **Storage type** = `hostPath`: a plain folder on one node. That is why the PV has `nodeAffinity` for `task1-m02`: without it the Pod could start on another node and find an empty folder.
+- **`manual` is only a label**, not a real StorageClass object (`kubectl get storageclass` only lists `standard`). It makes the PVC bind to my PV instead of Minikube creating its own volume under the default class.
+
+### 6. Services, IPs, ports and load balancing
+
+A Service is not a Pod and not a container, and it does not live on one node. It is a **fixed virtual IP and DNS name**; kube-proxy rules on **every node** make it work.
+
+| Thing | Address in my run | Notes |
+|---|---|---|
+| Service `mysql` | `10.105.182.6:3306` | Fixed. Forwards to the current MySQL Pod |
+| MySQL Pod | `10.244.25.138:3306` | Changed from `.132` to `.137` to `.138` as Pods were replaced |
+| Service `webapp-api` | `10.97.227.98:80` | Forwards to the Pods' port **8000** (`targetPort`) |
+| App Pods | `10.244.25.134:8000`, `10.244.73.5:8000` | The two endpoints |
+| Ingress | `192.168.49.2:80` | Address of a node in the Minikube network |
+| My tunnel | `localhost:18080` -> controller `:80` | Needed only because of Windows + Docker |
+
+- The app reaches MySQL by the **name `mysql`**: cluster DNS turns it into the Service IP, and kube-proxy forwards to the current MySQL Pod. The Pod IP can change without the app noticing.
+- **Load balancing:** a Service balances at **layer 4 (TCP)**. For each new connection, rules on the node (iptables, maintained by kube-proxy) choose one of the **ready** Pods. There is no separate load-balancer machine. The Ingress controller works at **layer 7 (HTTP)**, so it can route by path or hostname.
+
+### 7. Where the web page comes from
+
+The `Task-2` folder holds only Kubernetes files. The website (`index.html`, `style.css`) is inside the **app image**: `docker build` copied the course `webapp/app/static/` folder into it, and `main.py` serves it. The page also shows which app Pod answered and which MySQL Pod stored the data.
+
+### 8. How the YAML files in this repository relate
+
+Each file is the blueprint of one object. It creates the records in the cluster; the running Pods are then created from them.
+
+| File | Creates |
+|---|---|
+| `namespace.yaml` | Namespace `webapp-stack` |
+| `secret.yaml`, `configmap.yaml` | The Secret and the ConfigMap |
+| `pv.yaml`, `pvc.yaml` | The storage chain |
+| `mysql-deployment.yaml` | The MySQL Pod (through a ReplicaSet) |
+| `mysql-service.yaml` | The name and IP `mysql` |
+| `webapp-deployment.yaml` | The 2 FastAPI Pods |
+| `webapp-service.yaml` | The name and IP `webapp-api` |
+| `ingress.yaml` | The routing rule |
+
+**Not in this repository:** the application code and the original MySQL files (they come from the course repository; `mysql.Dockerfile` needs them next to it), the built images, the NGINX Ingress controller (installed by the Minikube addon), and the guestbook messages themselves (they live in the folder on `task1-m02`).
 
 ## Files in this folder
 
@@ -25,6 +111,8 @@ ConfigMap webapp-config (app settings)      Secret mysql-secret (credentials)
 | `webapp-service.yaml` | Service `webapp-api` (ClusterIP, 80 -> 8000) |
 | `ingress.yaml` | Ingress `webapp-ingress` (class `nginx`, path `/`) |
 | `mysql.Dockerfile` | The course MySQL Dockerfile plus one line that fixes the init script (see step 1) |
+| `images/` | The two architecture diagrams |
+| `screenshots/` | Evidence for every step |
 
 Note: the Secret contains the lab credentials given by the course, not production passwords.
 
@@ -35,6 +123,7 @@ I built `webapp-api:task2` from `webapp/` and `webapp-mysql:task2` from `mysql/`
 **Problem and fix.** The MySQL entrypoint *sources* `01-setup.sh` on the first start, so the script must be non-executable and use Linux (LF) line endings. On Windows, Git had converted the script to CRLF, and the first start failed with `$'\r': command not found`, so the `webapp` database was never created. I kept the supplied source unchanged and built the image with `mysql.Dockerfile`, which is the course Dockerfile plus one line that strips the carriage returns and sets mode 644.
 Verified inside the image: `-rw-r--r--` and CR count `0`.
 
+![initializing](screenshots/00-initializing.png)
 ![image fix](screenshots/01-mysql-image-fix.png)
 
 ## 2. Resetting MySQL before re-initialization
@@ -77,6 +166,7 @@ Through this path (browser -> Ingress -> Service `webapp-api` -> app Pod -> Serv
 - `GET /api/messages` returns my message plus the 2 default ones.
 - The web page shows which app Pod answered; both app Pods served requests, so the Service load-balances.
 
+![api_in_other_terminal](screenshots/06a-api.png)
 ![api tests](screenshots/06a-api-tests.png)
 ![browser](screenshots/06b-browser.png)
 
